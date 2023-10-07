@@ -1,0 +1,360 @@
+---
+title: "Analysis-Script-Reddit-NLP"
+author: "David Feng"
+date: "2023-10-04"
+output: html_document
+---
+
+```{r}
+# Load packages
+library("readxl")
+library("lsa")
+library("quanteda")
+library("quanteda.textplots")
+library("quanteda.textmodels")
+library("topicmodels")
+library("quanteda.textstats")
+library("plotly")
+library("ldatuning")
+library("doParallel")
+library("LDAvis")
+library("tidytext")
+library("dplyr")
+library("igraph")
+library("stringr")
+```
+
+```{r}
+# Import data
+rules <- read_excel("~/Desktop/OneDrive/PBS/LT/PB312/Rules_Reddit.xlsx")
+rules_only <- subset(rules, select = 'Rule')
+```
+
+```{r}
+# Create corpus
+rulesCorpus <- quanteda::corpus(rules, text_field = 'Rule')
+
+tokens <- quanteda::tokens(rulesCorpus, remove_punct = TRUE, remove_symbols = TRUE) %>%
+  quanteda::tokens_remove(pattern = quanteda::stopwords("en"))
+
+rulesDFM <- quanteda::dfm(tokens)
+df_word_freq <- quanteda::convert(rulesDFM, to = 'data.frame')
+
+rulesDFM %>% quanteda::topfeatures(n = 20, decreasing = TRUE)
+
+quanteda.textplots::textplot_wordcloud(rulesDFM)
+```
+
+```{r}
+# Apply lda
+raw.sum = apply(rulesDFM, 1, FUN = sum)
+rulesDFM = rulesDFM[raw.sum!=0,]
+
+topicmodel_lda <- topicmodels::LDA(rulesDFM, k = 10, control = list(seed = 1))
+
+topicmodel_lda %>% topicmodels::terms(20)
+```
+
+```{r}
+# Plot document frequency matrix
+features_dfm <- textstat_frequency(rulesDFM, n = 50)
+
+features_dfm$feature <- with(features_dfm, reorder(feature, -frequency))
+
+ggplot(features_dfm, aes(x = feature, y = frequency)) +
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+# Remove additional stopwords specific to Reddit
+rulesCorpus2 <- quanteda::corpus(rules, text_field = 'Rule')
+
+tokens2 <- quanteda::tokens(rulesCorpus, remove_punct = TRUE, remove_symbols = TRUE, remove_numbers = TRUE)
+
+tokens2 <- tokens_remove(tokens2, c(stopwords("english"), "posts", "must", "content", "post", "rule", "posting", "use", "rules", "please", "self", "ð", "ñ", "¼", "¾", "½", "â", "ø", "³"))
+
+rulesDFM2 <- quanteda::dfm(tokens2)
+
+df_word_freq <- quanteda::convert(rulesDFM2, to = 'data.frame')
+
+rulesDFM2 %>% quanteda::topfeatures(n = 20, decreasing = TRUE)
+
+quanteda.textplots::textplot_wordcloud(rulesDFM2)
+```
+
+```{r}
+# Apply lda again
+raw.sum = apply(rulesDFM2, 1, FUN = sum)
+rulesDFM2 = rulesDFM2[raw.sum!=0,]
+
+topicmodel_lda2 <- topicmodels::LDA(rulesDFM2, k = 20, control = list(seed = 1))
+
+topicmodel_lda2 %>% topicmodels::terms(20)
+```
+
+```{r}
+# Plot new DFM 
+features_dfm2 <- textstat_frequency(rulesDFM2, n = 50)
+
+features_dfm2$feature <- with(features_dfm2, reorder(feature, -frequency))
+
+ggplot(features_dfm2, aes(x = feature, y = frequency)) +
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Hyperparamter tuning: lda tuning
+```{r}
+# Run lda tuning
+system.time({
+  tunes <- FindTopicsNumber(
+    rulesDFM2,
+    topics = c(2, 3, 4, 5, 10, 20, 30, 40, 50, 75, 100, 200),
+    metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010"),
+    method = "Gibbs",
+    control = list(seed = 2),
+    mc.cores = 10L,
+    verbose = TRUE
+  )
+})
+
+FindTopicsNumber_plot(tunes)
+```
+
+Hyperparameter tuning: cross-validation
+```{r}
+# Run cross-validation
+cluster <- makeCluster(detectCores(logical = TRUE) - 1)
+registerDoParallel(cluster)
+
+clusterEvalQ(cluster, { library(topicmodels)})
+
+burnin = 1000
+iter = 1000
+keep = 50
+
+rulesDFM2_TM = convert(rulesDFM2, to = "topicmodels")
+
+#raw.sum=apply(rulesDFM2, 1, FUN = sum)
+#rulesDFM3 = rulesDFM2[raw.sum!=0,]
+
+n <- nrow(rulesDFM2_TM)
+folds <- 5
+splitfolds <- sample(1:folds, n, replace = TRUE)
+candidate_k <- c(2, 3, 4, 5, 10, 20, 30, 40, 50, 75, 100, 200)
+clusterExport(cluster, c("rulesDFM2_TM", "burnin", "iter", "keep", "splitfolds", "folds", "candidate_k"))
+
+system.time({
+  results <- foreach(j = 1:length(candidate_k), .combine = rbind) %dopar% {
+    k <- candidate_k[j]
+    results_1k <- matrix(0, nrow = folds, ncol = 2)
+    colnames(results_1k) <- c("k", "perplexity")
+    for(i in 1:folds){
+      train_set <- rulesDFM2_TM[splitfolds != i, ]
+      valid_set <- rulesDFM2_TM[splitfolds == i, ]
+      
+      fitted <- LDA(train_set, k = k, method = "Gibbs", control = list(burnin = burnin, iter = iter, keep = keep))
+      results_1k[i, ] <- c(k, perplexity(fitted, newdata = valid_set))
+    }
+    return(results_1k)
+  }
+})
+stopCluster(cluster)
+
+results_df <- as.data.frame(results)
+
+ggplot(results_df, aes(x = k, y = perplexity)) +
+  geom_point() +
+  geom_smooth(se = FALSE) +
+  theme(text = element_text(size = 12))
+```
+
+Final model
+```{r}
+# Fit final model
+topicmodel_final <- LDA(rulesDFM2_TM, k = 45, method = "Gibbs", control = list(burnin = burnin, iter = iter, keep = keep))
+topicmodel_final %>% topicmodels::terms(20)
+```
+
+Visualisation
+```{r}
+# Viusalise final model
+dtm = rulesDFM2[slam::row_sums(rulesDFM2) > 0,]
+phi = as.matrix(posterior(topicmodel_final)$terms)
+theta <- as.matrix(posterior(topicmodel_final)$topics)
+vocab <- colnames(phi)
+doc.length = slam::row_sums(dtm)
+term.freq = slam::col_sums(dtm)[match(vocab, colnames(dtm))]
+
+json = createJSON(phi = phi, theta = theta, vocab = vocab, doc.length = doc.length, term.frequency = term.freq)
+
+serVis(json)
+```
+
+```{r}
+# Plot top words by topic
+topics <- tidy(topicmodel_final, matrix = "beta")
+
+terms_per_topic <- 5
+
+top_terms <- topics %>%
+  group_by(topic) %>%
+  top_n(terms_per_topic, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms$topic[top_terms$topic == '1'] <- '1. Personal Attacks'
+top_terms$topic[top_terms$topic == '2'] <- '2. Miscellaneous'
+top_terms$topic[top_terms$topic == '3'] <- '3. Links'
+top_terms$topic[top_terms$topic == '4'] <- '4. Spoilers'
+top_terms$topic[top_terms$topic == '5'] <- '5. Explicit Content'
+
+top_terms$topic[top_terms$topic == '6'] <- '6. Advertisements'
+top_terms$topic[top_terms$topic == '7'] <- '7. Advertisements (Repeated)'
+top_terms$topic[top_terms$topic == '8'] <- '8. Attribution of Artistic Source'
+top_terms$topic[top_terms$topic == '9'] <- '9. Respect'
+top_terms$topic[top_terms$topic == '10'] <- '10. Limits in Frequency Over Time'
+
+top_terms$topic[top_terms$topic == '11'] <- '11. Reddit Terms'
+top_terms$topic[top_terms$topic == '12'] <- '12. Exchange of Goods'
+top_terms$topic[top_terms$topic == '13'] <- '13. Miscellaneous (Repeated)'
+top_terms$topic[top_terms$topic == '14'] <- '14. Adherence to Reddit Content Policy'
+top_terms$topic[top_terms$topic == '15'] <- '15. Visual Content'
+
+top_terms$topic[top_terms$topic == '16'] <- '16. Relevance'
+top_terms$topic[top_terms$topic == '17'] <- '17. Reposting and Spam'
+top_terms$topic[top_terms$topic == '18'] <- '18. Constructive Criticism'
+top_terms$topic[top_terms$topic == '19'] <- '19. Civility'
+top_terms$topic[top_terms$topic == '20'] <- '20. Advertisements (Repeated)'
+
+top_terms$topic[top_terms$topic == '21'] <- '21. Action Verbs in Reddit Usage'
+top_terms$topic[top_terms$topic == '22'] <- '22. Threads'
+top_terms$topic[top_terms$topic == '23'] <- '23. Accurate Context'
+top_terms$topic[top_terms$topic == '24'] <- '24. Medical and Legal Advice'
+top_terms$topic[top_terms$topic == '25'] <- '25. Offensive Behaviour'
+
+top_terms$topic[top_terms$topic == '26'] <- '26. Discrimination'
+top_terms$topic[top_terms$topic == '27'] <- '27. Trolling'
+top_terms$topic[top_terms$topic == '28'] <- '28. Role of Moderator'
+top_terms$topic[top_terms$topic == '29'] <- '29. Inappropriate Content'
+top_terms$topic[top_terms$topic == '30'] <- '30. Miscellaneous (Repeated)'
+
+top_terms$topic[top_terms$topic == '31'] <- '31. Music'
+top_terms$topic[top_terms$topic == '32'] <- '32. Threads (Repeated)'
+top_terms$topic[top_terms$topic == '33'] <- '33. Quality and Attribution'
+top_terms$topic[top_terms$topic == '34'] <- '34. NSFW'
+top_terms$topic[top_terms$topic == '35'] <- '35. Quality and Jokes'
+
+top_terms$topic[top_terms$topic == '36'] <- '36. Piracy and Illegal Behaviour'
+top_terms$topic[top_terms$topic == '37'] <- '37. Adherence to Topic'
+top_terms$topic[top_terms$topic == '38'] <- '38. Advertisements and Exchange of Goods'
+top_terms$topic[top_terms$topic == '39'] <- '39. Attribution of Artistic Source (Repeated)'
+top_terms$topic[top_terms$topic == '40'] <- '40. Civility (Repeated)'
+
+top_terms$topic[top_terms$topic == '41'] <- '41. Visual Content (Repeated)'
+top_terms$topic[top_terms$topic == '42'] <- '42. User Friendly'
+top_terms$topic[top_terms$topic == '43'] <- '43. Formatting'
+top_terms$topic[top_terms$topic == '44'] <- '44. Miscellaneous (Repeated)'
+top_terms$topic[top_terms$topic == '45'] <- '45. Civility (Repeated)'
+
+top_terms$topic <- factor(top_terms$topic)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+```{r}
+# Generate collocation statistics
+rulesCorpus3 <- quanteda::corpus(rules, text_field = 'Rule')
+
+rulesCorpus3 <- rulesCorpus3 %>%
+  tolower() %>%
+  paste0(collapse = " ") %>%
+  stringr::str_split(fixed(".")) %>%
+  unlist() %>%
+  stringr::str_squish()
+
+tokens3 <- quanteda::tokens(rulesCorpus3, remove_punct = TRUE, remove_symbols = TRUE, remove_numbers = TRUE)
+
+tokens3 <- tokens_remove(tokens3, c(stopwords("english"), "posts", "must", "content", "post", "rule", "posting", "use", "rules", "please", "self", "ð", "ñ", "¼", "¾", "½", "â", "ø", "³", "/", ","))
+
+collocations <- textstat_collocations(tokens3, size = 2, min_count = 20)
+collocations
+
+# Plot co-occurrence network
+
+rulesDFM3 <- rulesCorpus3 %>%
+  quanteda::dfm() %>%
+  quanteda::dfm_trim(min_termfreq = 10, verbose = FALSE) %>%
+  quanteda::dfm(remove = stopwords("english"), remove_punct = TRUE, remove_symbols = TRUE, remove_numbers = TRUE) %>%
+  dfm_remove(c(stopwords("english"), "posts", "must", "content", "post", "rule", "posting", "use", "rules", "please", "self", "ð", "ñ", "¼", "¾", "½", "â", "ø", "³", "/", ","))
+
+source("https://slcladal.github.io/rscripts/calculateCoocStatistics.R")
+corr_term <- "quality"
+n <- 10
+corr <- calculateCoocStatistics(corr_term, rulesDFM3, measure = "LOGLIK")
+corr[1:n]
+
+reduced_dfm <- dfm_select(rulesDFM3, pattern = c(names(corr)[1:n], "quality"))
+
+tag_featurecomatrix <- fcm(reduced_dfm)
+
+resultGraph <- data.frame(from = character(), to = character(), sig = numeric(0))
+tmpGraph <- data.frame(from = character(), to = character(), sig = numeric(0))
+
+tmpGraph[1:n, 3] <- corr[1:n]
+tmpGraph[, 1] <- corr_term
+tmpGraph[, 2] <- names(corr)[1:n]
+tmpGraph[, 3] <- corr[1:n]
+
+resultGraph <- rbind(resultGraph, tmpGraph)
+resultGraph
+
+for (i in 1:n){
+  newterm <- names(corr)[i]
+  coocs2 <- calculateCoocStatistics(newterm, rulesDFM3, measure = "LOGLIK")
+  coocs2[1:15]
+  
+  tmpGraph <- data.frame(from = character(), to = character(), sig = numeric(0))
+  tmpGraph[1:n, 3] <- coocs2[1:n]
+  tmpGraph[, 1] <- newterm
+  tmpGraph[, 2] <- names(coocs2)[1:n]
+  tmpGraph[, 3] <- coocs2[1:n]
+  
+  resultGraph <- rbind(resultGraph, tmpGraph[2:length(tmpGraph[, 1]), ])
+}
+
+resultGraph
+
+graphNetwork <- graph.data.frame(resultGraph, directed = F)
+verticesremove <- V(graphNetwork)[degree(graphNetwork) < 2]
+graphNetwork <- delete.vertices(graphNetwork, verticesremove)
+
+V(graphNetwork)$color <- ifelse(V(graphNetwork)$name == corr_term, 'lightpink', 'lightblue')
+
+E(graphNetwork)$color <- adjustcolor("black", alpha.f = .5)
+E(graphNetwork)$width <- scales::rescale(E(graphNetwork)$sig, to = c(1, 10))
+
+E(graphNetwork)$curved <- 0.15
+V(graphNetwork)$size <- scales::rescale(log(degree(graphNetwork)), to = c(5, 15))
+
+par(mai = c(0,0,1,0))
+
+plot(graphNetwork,
+     layout = layout.fruchterman.reingold,
+     main = paste(corr_term, ' Graph'),
+     vertex.label.family = "sans",
+     vertex.label.cex = 1,
+     vertex.shape = "circle",
+     vertex.label.dist = 0,
+     vertex.frame.color = adjustcolor("black", alpha.f = .5),
+     vertex.label.color = 'black',
+     vertex.label.font = 2,
+     vertex.label = V(graphNetwork)$name,
+     vertex.label.cex = 1)
+```
